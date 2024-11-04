@@ -253,13 +253,10 @@ void RunRawTTY()
 
 uint8_t EnterMonitor()
 {
-    uint8_t buf[32];
+    uint8_t buf[2] = {'0', '>'}; // "C0.0.0.0/0\n0>" -- 0> = OK, 9> = Invalid cmd
 
     printf("Entering monitor mode\n");
     fflush(stdout);
-
-    snprintf(buf, 32, ">");   // "C0.0.0.0/0\n0>" Manual implies it should end in 0> not 9> (0> = OK, 9> = Invalid cmd)
-    write(gLocal_fd, buf, strlen(buf));
 
     if (gRemote_fd != -1)
     {
@@ -267,17 +264,25 @@ uint8_t EnterMonitor()
         CloseRemoteSocket();
     }
 
+    write(gLocal_fd, buf, 2);
+
     return 1;
 }
 
 uint8_t ExitMonitor()
 {
-    uint8_t buf[32];
+    uint8_t buf[6] = {'Q', 'U', '\n', '\r', '0', '>'}; // "QU\n0>" -- 0> = OK, 9> = Invalid cmd
     printf("Exit monitor mode\n");   
     fflush(stdout);
 
-    snprintf(buf, 32, "QU\n\r0>");   // "QU\n0>" -- Manual implies it should end in 0> not 9> (0> = OK, 9> = Invalid cmd)
-    write(gLocal_fd, buf, strlen(buf));
+    // In case the remote socket wasn't closed at EnterMonitor() for some reason...
+    if (gRemote_fd != -1)
+    {
+        printf("Connection is open, was the xPort reset? Closing remote socket...\n");
+        CloseRemoteSocket();
+    }
+
+    write(gLocal_fd, buf, 6);
 
     return 0;
 }
@@ -340,9 +345,17 @@ void RunXPortEmulation()
     int r_rx = 0, r_tx = 0;             // Number of bytes received in buf_rx/buf_tx
     int bInMonitorMode = 0;             // Flag indicating if the emulated xport device is in monitor mode
 
-    // Buffer for gLocal_fd data - Used to match or determine if a certain string should be parsed as an xport command or sent along to the remote server socket
+    // Enter monitor mode specific pattern matching variables (Used when connected to remote server)
+    int EC = 0, NC = 0;
+    const char ENTER_PATTERN[] = "C0.0.0.0/0";
+    const int ENTER_LENGTH = sizeof(ENTER_PATTERN) - 1; // Length of pattern without null terminator
+
+    // Buffer for gLocal_fd data - Used to accumulate and check for the target command
     uint8_t rxdata_buffer[512];
     int rxdata_buffer_len = 0;
+
+    pFileRemote = fopen("rx.log", "wb");
+    pFileLocal = fopen("tx.log", "wb");
 
     while (1)
     {
@@ -352,89 +365,132 @@ void RunXPortEmulation()
         {
             // Forward received data from gRemote_fd to gLocal_fd
             write(gLocal_fd, buf_rx, r_rx);
+
+            // Log all RX traffic
+            fwrite(buf_rx, sizeof(char), r_rx, pFileRemote);
+            fflush(pFileRemote);
         }
 
         // Read from gLocal_fd if data is available
         r_tx = recv(gLocal_fd, buf_tx, sizeof(buf_tx), MSG_DONTWAIT);
         if (r_tx > 0)
         {
-            // Append received data to the persistent buffer
-            if (rxdata_buffer_len + r_tx < sizeof(rxdata_buffer))
+            // Log all TX traffic
+            fwrite(buf_tx, sizeof(char), r_tx, pFileLocal);
+            fflush(pFileLocal);
+
+            // If connected to remote server, handle data transfer
+            if (gRemote_fd != -1)
             {
-                memcpy(rxdata_buffer + rxdata_buffer_len, buf_tx, r_tx);
-                rxdata_buffer_len += r_tx;
+                // Append received data to the persistent buffer
+                if (rxdata_buffer_len + r_tx < sizeof(rxdata_buffer))
+                {
+                    memcpy(rxdata_buffer + rxdata_buffer_len, buf_tx, r_tx);
+                    rxdata_buffer_len += r_tx;
+
+                    NC++; // Increment received character count
+
+                    if (rxdata_buffer[NC - 1] == ENTER_PATTERN[EC]) 
+                    {
+                        EC++; // Increment expected count if this character matches the pattern
+                    } 
+                    else 
+                    {
+                        // Reset both counters if there's a mismatch
+                        NC = 0;
+                        EC = 0;
+                    }
+
+                    // If the entire pattern is matched, enter monitor mode
+                    if (EC == ENTER_LENGTH) 
+                    {
+                        bInMonitorMode = EnterMonitor();
+                        rxdata_buffer_len = 0;
+                        EC = 0;
+                        NC = 0;
+                    } 
+                    else if (EC == 0) 
+                    {
+                        // If we aren't in the middle of matching the pattern, forward data to gRemote_fd
+                        write(gRemote_fd, rxdata_buffer, rxdata_buffer_len);
+                        rxdata_buffer_len = 0; // Clear buffer after forwarding
+                        NC = 0;
+                    }
+                }
             }
-
-            // Process buffer only if it contains a newline character
-            uint8_t *newline = memchr(rxdata_buffer, '\n', rxdata_buffer_len);
-            if (newline)
+            else
             {
-                // Calculate the length of the command up to and including the newline
-                int cmd_len = newline - rxdata_buffer + 1;
+                // If gRemote_fd is not connected, just accumulate and parse for commands
 
-                // Temporarily null-terminate for command matching
-                rxdata_buffer[cmd_len - 1] = '\0';
+                // Append received data to the persistent buffer
+                if (rxdata_buffer_len + r_tx < sizeof(rxdata_buffer))
+                {
+                    memcpy(rxdata_buffer + rxdata_buffer_len, buf_tx, r_tx);
+                    rxdata_buffer_len += r_tx;
+                }
 
-                // Check for known commands in order of specificity
-                if (strcmp((char *)rxdata_buffer, "QU") == 0)
+                // Process buffer only if it contains a newline character
+                uint8_t *newline = memchr(rxdata_buffer, '\n', rxdata_buffer_len);
+                if (newline)
                 {
-                    bInMonitorMode = ExitMonitor();
-                }
-                else if (strcmp((char *)rxdata_buffer, "C0.0.0.0/0") == 0)
-                {
-                    bInMonitorMode = EnterMonitor();
-                }
-                else if (bInMonitorMode && strcmp((char *)rxdata_buffer, "NC") == 0)
-                {
-                    GetLocalIP();
-                }
-                else if (bInMonitorMode && strncmp((char *)rxdata_buffer, "PI ", 3) == 0)
-                {
-                    // Process "PI <IP>" command
-                    char ip_address[256] = {0};
-                    strncpy(ip_address, (char *)rxdata_buffer + 3, cmd_len - 4); // Exclude "PI " and '\0'
-                    PingIP(ip_address);
-                }
-                else if (rxdata_buffer[0] == 'C' && gRemote_fd == -1)
-                {
-                    // Process "C<address>" command
-                    char target[256] = {0};
-                    strncpy(target, (char *)rxdata_buffer + 1, cmd_len - 2);  // Exclude 'C' and '\0'
+                    // Calculate the length of the command up to and including the newline
+                    int cmd_len = newline - rxdata_buffer + 1;
 
-                    // Extract port if specified
-                    char *port_str = strchr(target, ':');
-                    if (port_str)
+                    // Temporarily null-terminate for command matching
+                    rxdata_buffer[cmd_len - 1] = '\0';
+
+                    // Check for known commands in order of specificity
+                    if (strcmp((char *)rxdata_buffer, "QU") == 0)
                     {
-                        *port_str = '\0';
-                        port_str++;
-                        gRemotePort = atoi(port_str);
+                        bInMonitorMode = ExitMonitor();
                     }
-                    else
+                    else if (strcmp((char *)rxdata_buffer, "C0.0.0.0/0") == 0)
                     {
-                        gRemotePort = 0;
+                        bInMonitorMode = EnterMonitor();
                     }
-
-                    if (ResolveHost(target) == 0)
+                    else if (bInMonitorMode && strcmp((char *)rxdata_buffer, "NC") == 0)
                     {
-                        char buf[4];
-                        if (ConnectRemoteTCP()) snprintf(buf, 4, "N");
-                        else snprintf(buf, 4, "C");
-
-                        write(gLocal_fd, buf, strlen(buf));
+                        GetLocalIP();
                     }
-                }
-                else if (!bInMonitorMode && gRemote_fd != -1)
-                {
-                    // Restore the newline character for forwarding to gRemote_fd
-                    rxdata_buffer[cmd_len - 1] = '\n';
+                    else if (bInMonitorMode && strncmp((char *)rxdata_buffer, "PI ", 3) == 0)
+                    {
+                        // Process "PI <IP>" command
+                        char ip_address[256] = {0};
+                        strncpy(ip_address, (char *)rxdata_buffer + 3, cmd_len - 4); // Exclude "PI " and '\0'
+                        PingIP(ip_address);
+                    }
+                    else if (rxdata_buffer[0] == 'C' && gRemote_fd == -1)
+                    {
+                        // Process "C<address>" command
+                        char target[256] = {0};
+                        strncpy(target, (char *)rxdata_buffer + 1, cmd_len - 2);  // Exclude 'C' and '\0'
 
-                    // Forward unmatched data, including newline, to gRemote_fd
-                    write(gRemote_fd, rxdata_buffer, cmd_len);
-                }
+                        // Extract port if specified
+                        char *port_str = strchr(target, ':');
+                        if (port_str)
+                        {
+                            *port_str = '\0';
+                            port_str++;
+                            gRemotePort = atoi(port_str);
+                        }
+                        else
+                        {
+                            gRemotePort = 0;
+                        }
 
-                // Remove processed command from the buffer
-                rxdata_buffer_len -= cmd_len;
-                memmove(rxdata_buffer, rxdata_buffer + cmd_len, rxdata_buffer_len);
+                        if (ResolveHost(target) == 0)
+                        {
+                            char buf[4];
+                            snprintf(buf, sizeof(buf), ConnectRemoteTCP() ? "N" : "C");
+
+                            write(gLocal_fd, buf, strlen(buf));
+                        }
+                    }
+
+                    // Remove processed command from the buffer
+                    rxdata_buffer_len -= cmd_len;
+                    memmove(rxdata_buffer, rxdata_buffer + cmd_len, rxdata_buffer_len);
+                }
             }
         }
 

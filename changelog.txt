@@ -1,0 +1,3 @@
+v1.1 Bugfixes
+Changed the xport emulator to not rely on \n (newline) anymore to know when to process data. This fixes IAC communications with Telnet servers.
+Added traffic logging to the xport emulator. Data will be output to rx.log and tx.log respectively.
