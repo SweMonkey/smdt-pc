@@ -198,7 +198,7 @@ void OpenLocalSocket()
     bzero(&localsock, sizeof(localsock));
 
     localsock.sun_family = AF_UNIX;    
-    memcpy(localsock.sun_path, gLocalAddress, 108);
+    memcpy(localsock.sun_path, gLocalAddress, sizeof(localsock.sun_path));
 
     // Connect the client socket to server socket
     if (connect(gLocal_fd, (SA*)&localsock, sizeof(localsock)) != 0) 
