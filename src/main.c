@@ -472,7 +472,9 @@ void RunXPortEmulation()
                         EC = 0;
                         NC = 0;
                     } 
-                    //else if (EC == 0) // This is commented out because the above code makes the user unable to type/send any of the characters in ENTER_PATTERN - This is a workaround to keep sending the characters even if it is meant only for the xport emulator...
+                    //else if (EC == 0) 
+                    // ^ This is commented out because the above code makes the user unable to type/send any of the characters in ENTER_PATTERN
+                    // This is a workaround to keep sending the characters even if it is meant only for the xport emulator...
                     {
                         // If we aren't in the middle of matching the pattern, forward data to gRemote_fd
                         send(gRemote_fd, rxdata_buffer, rxdata_buffer_len, MSG_DONTWAIT);
