@@ -16,13 +16,14 @@
 #include <sys/un.h>
 
 #define SA struct sockaddr
-#define ADDR_LEN 128
+#define ADDR_LEN 256
 
 char gRemoteIP[ADDR_LEN];     // IP of server socket as ASCII string
 uint16_t gRemotePort;         // Port of server socket
 char gLocalAddress[ADDR_LEN]; // Address of local socket
 int gRemote_fd = -1;          // Remote server socket
 int gLocal_fd = -1;           // Local client socket/file
+int bTTY_Connection = 0;
 
 // Logging files
 FILE *pFileRemote, *pFileLocal;
@@ -135,6 +136,12 @@ void OpenLocalTTY()
     // Open the serial port
     gLocal_fd = open(gLocalAddress, O_RDWR);
 
+    if (gLocal_fd < 0)
+    {
+        printf("Error %i from open(tty): %s\n", errno, strerror(errno));
+        exit(EXIT_FAILURE); 
+    }
+
     // Create new termios struct, we call it 'tty' for convention
     struct termios tty;
 
@@ -169,7 +176,7 @@ void OpenLocalTTY()
     tty.c_cc[VTIME] = 1;    // Wait for up to 1s (10 deciseconds), returning as soon as any data is received.
     tty.c_cc[VMIN] = 0;
 
-    // Set in/out baud rate to be 9600
+    // Set in/out baud rate to be 4800
     cfsetispeed(&tty, B4800);
     cfsetospeed(&tty, B4800);
 
@@ -180,33 +187,65 @@ void OpenLocalTTY()
         exit(EXIT_FAILURE); 
     }
 
+    bTTY_Connection = 1;
+
     printf("Local tty \"%s\" is OK...\n", gLocalAddress);
 }
 
-void OpenLocalSocket()
+int OpenLocalSocket()
 {    
     struct sockaddr_un localsock;
     
     // Socket create and verification
-    gLocal_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (gLocal_fd == -1) gLocal_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+
     if (gLocal_fd == -1) 
     {
-        printf("Internal socket connection failed...\n");
+        printf("Local socket connection failed...\n");
         exit(EXIT_FAILURE); 
     }
 
     bzero(&localsock, sizeof(localsock));
 
     localsock.sun_family = AF_UNIX;    
-    memcpy(localsock.sun_path, gLocalAddress, 108);
+    memcpy(localsock.sun_path, gLocalAddress, sizeof(localsock.sun_path));
 
     // Connect the client socket to server socket
     if (connect(gLocal_fd, (SA*)&localsock, sizeof(localsock)) != 0) 
     {
-        printf("Connection to \"%s\" failed...\n", gLocalAddress);
-        exit(EXIT_FAILURE);
+        return -1;
     }
-    else printf("Connected to \"%s\"...\n", gLocalAddress);
+
+    bTTY_Connection = 0;
+
+    return 0;
+}
+
+int OpenRemoteSocket()
+{    
+    struct sockaddr_un remotesock;
+    
+    // Socket create and verification
+    if (gRemote_fd == -1) gRemote_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+
+    if (gRemote_fd == -1) 
+    {
+        printf("Remote socket connection failed...\n");
+        exit(EXIT_FAILURE); 
+    }
+
+    bzero(&remotesock, sizeof(remotesock));
+
+    remotesock.sun_family = AF_UNIX;    
+    memcpy(remotesock.sun_path, gRemoteIP, sizeof(remotesock.sun_path));
+
+    // Connect the client socket to server socket
+    if (connect(gRemote_fd, (SA*)&remotesock, sizeof(remotesock)) != 0) 
+    {
+        return -1;
+    }
+
+    return 0;
 }
 
 void RunRawTTY()
@@ -251,6 +290,26 @@ void RunRawTTY()
     exit(EXIT_SUCCESS);
 }
 
+void WaitForLocal()
+{
+    printf("Waiting for local connection on \"%s\"...\n", gLocalAddress);
+
+    while (OpenLocalSocket() != 0)
+    {
+        sleep(3);
+    }
+}
+
+void WaitForRemote()
+{
+    printf("Waiting for remote connection on \"%s\"...\n", gRemoteIP);
+
+    while (OpenRemoteSocket() != 0)
+    {
+        sleep(3);
+    }
+}
+
 uint8_t EnterMonitor()
 {
     uint8_t buf[2] = {'0', '>'}; // "C0.0.0.0/0\n0>" -- 0> = OK, 9> = Invalid cmd
@@ -272,7 +331,7 @@ uint8_t EnterMonitor()
 uint8_t ExitMonitor()
 {
     uint8_t buf[6] = {'Q', 'U', '\n', '\r', '0', '>'}; // "QU\n0>" -- 0> = OK, 9> = Invalid cmd
-    printf("Exit monitor mode\n");   
+    printf("Exiting monitor mode\n");   
     fflush(stdout);
 
     // In case the remote socket wasn't closed at EnterMonitor() for some reason...
@@ -372,7 +431,11 @@ void RunXPortEmulation()
         }
 
         // Read from gLocal_fd if data is available
-        r_tx = recv(gLocal_fd, buf_tx, sizeof(buf_tx), MSG_DONTWAIT);
+        if (bTTY_Connection) 
+            r_tx = read(gLocal_fd, buf_tx, sizeof(buf_tx));
+        else 
+            r_tx = recv(gLocal_fd, buf_tx, sizeof(buf_tx), MSG_DONTWAIT);
+
         if (r_tx > 0)
         {
             // Log all TX traffic
@@ -409,10 +472,10 @@ void RunXPortEmulation()
                         EC = 0;
                         NC = 0;
                     } 
-                    else if (EC == 0) 
+                    //else if (EC == 0) // This is commented out because the above code makes the user unable to type/send any of the characters in ENTER_PATTERN - This is a workaround to keep sending the characters even if it is meant only for the xport emulator...
                     {
                         // If we aren't in the middle of matching the pattern, forward data to gRemote_fd
-                        write(gRemote_fd, rxdata_buffer, rxdata_buffer_len);
+                        send(gRemote_fd, rxdata_buffer, rxdata_buffer_len, MSG_DONTWAIT);
                         rxdata_buffer_len = 0; // Clear buffer after forwarding
                         NC = 0;
                     }
@@ -517,7 +580,7 @@ int main(int argc, char *argv[])
     atexit(Shutdown);
 
     if ((argc > 2) && (strcmp(argv[1], "-xport") == 0))
-    {        
+    {
         strncpy(gLocalAddress, argv[2], ADDR_LEN);
         OpenLocalTTY();
 
@@ -525,9 +588,11 @@ int main(int argc, char *argv[])
     }
     else if ((argc > 2) && (strcmp(argv[1], "-xportsock") == 0))
     {
-
         strncpy(gLocalAddress, argv[2], ADDR_LEN);
-        OpenLocalSocket();
+        if (OpenLocalSocket())
+        {
+            WaitForLocal();
+        }
 
         RunXPortEmulation();
     }
@@ -569,7 +634,7 @@ int main(int argc, char *argv[])
     }
     else 
     {
-        printf("SMDT PC Communicator v1.1\n\nUsage example:\n", argv[0]);
+        printf("SMDT PC Communicator v1.2\n\nUsage example:\n", argv[0]);
         printf("%s -local=/dev/ttyS4 -remote=127.0.0.1:6969     - Connect local serial port to remote server\n", argv[0]);
         printf("%s -xport /dev/ttyS4                            - xPort emulator communication using local serial port\n", argv[0]);
         printf("%s -xportsock ./socketfile.sock                 - xPort emulator communication using sockets\n\n", argv[0]);
