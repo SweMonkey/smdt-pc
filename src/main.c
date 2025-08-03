@@ -1,4 +1,3 @@
-
 #include <arpa/inet.h>  // inet_addr()
 #include <netdb.h>
 #include <stdio.h>
@@ -14,16 +13,19 @@
 #include <sys/time.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <regex.h>
 
 #define SA struct sockaddr
 #define ADDR_LEN 256
+#define BUF_SIZE 32
 
 char gRemoteIP[ADDR_LEN];     // IP of server socket as ASCII string
 uint16_t gRemotePort;         // Port of server socket
 char gLocalAddress[ADDR_LEN]; // Address of local socket
 int gRemote_fd = -1;          // Remote server socket
 int gLocal_fd = -1;           // Local client socket/file
-int bTTY_Connection = 0;
+int bTTY_Connection = 0;      // 0 = Using sockets for remote - 1 = Using local serial port for remote
+int bInMonitorMode = 0;       // Flag indicating if the emulated xport device is in monitor mode
 
 // Logging files
 FILE *pFileRemote, *pFileLocal;
@@ -54,14 +56,21 @@ void Shutdown(void)
     CloseRemoteSocket();
     close(gLocal_fd);
 
-    fclose(pFileRemote);
-    fclose(pFileLocal);
+    if (pFileRemote != NULL) fclose(pFileRemote);
+    if (pFileLocal != NULL) fclose(pFileLocal);
 }
 
-void SignCB(int signum)
+void SigCB(int signum)
 {
-    printf("Caught signal %u\n", signum);
+    printf("Caught signal %d (%s)\n", signum, strsignal(signum));
     exit(signum);
+}
+
+void SigPipe(int signum)
+{
+    printf("Caught signal %d (%s)\n", signum, strsignal(signum));
+    exit(signum);
+    
 }
 
 int ResolveHost(char *hostname)
@@ -76,11 +85,11 @@ int ResolveHost(char *hostname)
         return 1;
     }
 
-    addr_list = (struct in_addr **) hent->h_addr_list;
+    addr_list = (struct in_addr **)hent->h_addr_list;
 
-    for(i = 0; addr_list[i] != NULL; i++)
+    for (i = 0; addr_list[i] != NULL; i++)
     {
-        strcpy(gRemoteIP , inet_ntoa(*addr_list[i]));
+        strcpy(gRemoteIP, inet_ntoa(*addr_list[i]));
         return 0;
     }
 
@@ -121,7 +130,6 @@ int ConnectRemoteTCP()
     if (connect(gRemote_fd, (SA*)&servaddr, sizeof(servaddr)) != 0) 
     {
         printf("Connection to \"%s:%u\" failed...\n", gRemoteIP, gRemotePort);
-
         CloseRemoteSocket();
 
         return 2;
@@ -152,28 +160,30 @@ void OpenLocalTTY()
         exit(EXIT_FAILURE); 
     }
 
-    tty.c_cflag &= ~PARENB; // Clear parity bit, disabling parity (most common)
-    tty.c_cflag &= ~CSTOPB; // Clear stop field, only one stop bit used in communication (most common)
-    tty.c_cflag &= ~CSIZE; // Clear all bits that set the data size 
-    tty.c_cflag |= CS8; // 8 bits per byte (most common)
-    tty.c_cflag &= ~CRTSCTS; // Disable RTS/CTS hardware flow control (most common)
-    tty.c_cflag |= CREAD | CLOCAL; // Turn on READ & ignore ctrl lines (CLOCAL = 1)
+    tty.c_cflag &= ~PARENB;         // Clear parity bit, disabling parity (most common)
+    tty.c_cflag &= ~CSTOPB;         // Clear stop field, only one stop bit used in communication (most common)
+    tty.c_cflag &= ~CSIZE;          // Clear all bits that set the data size 
+    tty.c_cflag |= CS8;             // 8 bits per byte (most common)
+    tty.c_cflag &= ~CRTSCTS;        // Disable RTS/CTS hardware flow control (most common)
+    tty.c_cflag |= CREAD | CLOCAL;  // Turn on READ & ignore ctrl lines (CLOCAL = 1)
 
     tty.c_lflag &= ~ICANON;
-    tty.c_lflag &= ~ECHO; // Disable echo
-    tty.c_lflag &= ~ECHOE; // Disable erasure
-    tty.c_lflag &= ~ECHONL; // Disable new-line echo
-    tty.c_lflag &= ~ISIG; // Disable interpretation of INTR, QUIT and SUSP
-    tty.c_iflag &= ~(IXON | IXOFF | IXANY); // Turn off s/w flow ctrl
-    //tty.c_iflag |= (IXON | IXOFF | IXANY); // Turn on s/w flow ctrl
-    tty.c_iflag &= ~(IGNBRK|BRKINT|PARMRK|ISTRIP|INLCR|IGNCR|ICRNL); // Disable any special handling of received bytes
+    tty.c_lflag &= ~ECHO;           // Disable echo
+    tty.c_lflag &= ~ECHOE;          // Disable erasure
+    tty.c_lflag &= ~ECHONL;         // Disable new-line echo
+    tty.c_lflag &= ~ISIG;           // Disable interpretation of INTR, QUIT and SUSP
 
-    tty.c_oflag &= ~OPOST; // Prevent special interpretation of output bytes (e.g. newline chars)
-    tty.c_oflag &= ~ONLCR; // Prevent conversion of newline to carriage return/line feed
-    // tty.c_oflag &= ~OXTABS; // Prevent conversion of tabs to spaces (NOT PRESENT ON LINUX)
-    // tty.c_oflag &= ~ONOEOT; // Prevent removal of C-d chars (0x004) in output (NOT PRESENT ON LINUX)
+    tty.c_iflag &= ~(IXON | IXOFF | IXANY);     // Turn off s/w flow ctrl
+    //tty.c_iflag |= (IXON | IXOFF | IXANY);    // Turn on s/w flow ctrl
 
-    tty.c_cc[VTIME] = 1;    // Wait for up to 1s (10 deciseconds), returning as soon as any data is received.
+    tty.c_iflag &= ~(IGNBRK|BRKINT|PARMRK|ISTRIP|INLCR|IGNCR|ICRNL);    // Disable any special handling of received bytes
+
+    tty.c_oflag &= ~OPOST;      // Prevent special interpretation of output bytes (e.g. newline chars)
+    tty.c_oflag &= ~ONLCR;      // Prevent conversion of newline to carriage return/line feed
+    //tty.c_oflag &= ~OXTABS;   // Prevent conversion of tabs to spaces (NOT PRESENT ON LINUX)
+    //tty.c_oflag &= ~ONOEOT;   // Prevent removal of C-d chars (0x004) in output (NOT PRESENT ON LINUX)
+
+    tty.c_cc[VTIME] = 1;        // Wait for up to 1s (10 deciseconds), returning as soon as any data is received.
     tty.c_cc[VMIN] = 0;
 
     // Set in/out baud rate to be 4800
@@ -195,14 +205,20 @@ void OpenLocalTTY()
 int OpenLocalSocket()
 {    
     struct sockaddr_un localsock;
+
+    if (gLocal_fd != -1) 
+    {
+        close(gLocal_fd);
+        gLocal_fd = -1;
+    }
     
-    // Socket create and verification
-    if (gLocal_fd == -1) gLocal_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    // Create and verify local socket
+    gLocal_fd = socket(AF_UNIX, SOCK_STREAM, 0);
 
     if (gLocal_fd == -1) 
     {
-        printf("Local socket connection failed...\n");
-        exit(EXIT_FAILURE); 
+        perror("Local socket creation failed");
+        exit(EXIT_FAILURE);
     }
 
     bzero(&localsock, sizeof(localsock));
@@ -213,6 +229,18 @@ int OpenLocalSocket()
     // Connect the client socket to server socket
     if (connect(gLocal_fd, (SA*)&localsock, sizeof(localsock)) != 0) 
     {
+        int err = errno;
+
+        perror("Local socket connection failed");
+
+        if (err == ECONNREFUSED)
+        {
+            printf("Please delete the stale file \"%s\" and try again\n", gLocalAddress);
+            exit(EXIT_FAILURE);
+        }
+
+        close(gLocal_fd);
+        gLocal_fd = -1;
         return -1;
     }
 
@@ -225,13 +253,19 @@ int OpenRemoteSocket()
 {    
     struct sockaddr_un remotesock;
     
-    // Socket create and verification
-    if (gRemote_fd == -1) gRemote_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (gRemote_fd != -1) 
+    {
+        close(gRemote_fd);
+        gRemote_fd = -1;
+    }
+    
+    // Create and verify remote socket
+    gRemote_fd = socket(AF_UNIX, SOCK_STREAM, 0);
 
     if (gRemote_fd == -1) 
     {
-        printf("Remote socket connection failed...\n");
-        exit(EXIT_FAILURE); 
+        perror("Remote socket creation failed");
+        exit(EXIT_FAILURE);
     }
 
     bzero(&remotesock, sizeof(remotesock));
@@ -242,6 +276,9 @@ int OpenRemoteSocket()
     // Connect the client socket to server socket
     if (connect(gRemote_fd, (SA*)&remotesock, sizeof(remotesock)) != 0) 
     {
+        perror("Remote socket connection failed");
+        close(gRemote_fd);
+        gRemote_fd = -1;
         return -1;
     }
 
@@ -253,7 +290,7 @@ void RunRawTTY()
     OpenLocalTTY();
     if (ConnectRemoteTCP()) exit(EXIT_FAILURE);
 
-    uint8_t buf_rx[256], buf_tx[256];
+    uint8_t buf_rx[BUF_SIZE], buf_tx[BUF_SIZE];
     int r_rx = 0, r_tx = 0;
 
     pFileRemote = fopen("rx.log" , "wb");
@@ -261,7 +298,7 @@ void RunRawTTY()
 
     while(1)
     {
-        r_rx = recv(gRemote_fd, &buf_rx, 256, MSG_DONTWAIT);
+        r_rx = recv(gRemote_fd, &buf_rx, BUF_SIZE, MSG_DONTWAIT);
 
         if (r_rx)
         {
@@ -273,7 +310,7 @@ void RunRawTTY()
             }
         }
 
-        r_tx = read(gLocal_fd, &buf_tx, 256);
+        r_tx = read(gLocal_fd, &buf_tx, BUF_SIZE);
         if (r_tx)
         {
             write(gRemote_fd, buf_tx, r_tx);
@@ -296,8 +333,10 @@ void WaitForLocal()
 
     while (OpenLocalSocket() != 0)
     {
-        sleep(3);
+        fflush(stdout);
+        sleep(5);
     }
+    printf("\nLocal connected!\n");
 }
 
 void WaitForRemote()
@@ -306,8 +345,10 @@ void WaitForRemote()
 
     while (OpenRemoteSocket() != 0)
     {
-        sleep(3);
+        fflush(stdout);
+        sleep(5);
     }
+    printf("\nRemote connected!\n");
 }
 
 uint8_t EnterMonitor()
@@ -324,6 +365,8 @@ uint8_t EnterMonitor()
     }
 
     write(gLocal_fd, buf, 2);
+
+    bInMonitorMode = 1;
 
     return 1;
 }
@@ -342,6 +385,8 @@ uint8_t ExitMonitor()
     }
 
     write(gLocal_fd, buf, 6);
+
+    bInMonitorMode = 0;
 
     return 0;
 }
@@ -384,37 +429,177 @@ void GetLocalIP()
 
 void PingIP(char *ipaddr)
 {
-    uint8_t buf[256];
-    printf("Pinging IP address \"%s\" ...\n", ipaddr);   
+    char cmdbuf[64];
+
+    snprintf(cmdbuf, 64, "ping -c 5 -W 10 %s", ipaddr);
+
+    char pingbuf[256];
+
+    // Read out "ping" command output
+    FILE *fd = popen(cmdbuf, "r");
+
+    if (fd == NULL) 
+    {
+        printf("Could not open pipe to \"ping\"\n");
+    }
+    else
+    {
+        write(gLocal_fd, "  \r", 3);
+
+        // Put output into a string
+        for (int i = 0; i < 6; i++)
+        {
+            fgets(pingbuf, 256, fd);
+            
+            if (i == 0) continue;
+
+            write(gLocal_fd, pingbuf, strlen(pingbuf));
+
+            printf("Returning ping response: %.*s", strlen(pingbuf), pingbuf);
+
+            if (i >= 5)
+            {
+                write(gLocal_fd, "\n", 1);
+            }
+        }
+    }
+    
     fflush(stdout);
+}
 
-    snprintf(buf, 256, "  Ping is not implemented in xPort emu\n"); // Note the leading 2 spaces, SMDTC ignores those and only prints the following text
+typedef enum {
+    PAT_NONE = 0,
+    PAT_C_MONITOR,     // "C0.0.0.0/0"    - Enter monitor mode
+    PAT_C_ADDR_PORT, // "Cxxxx:yyyy"    - Connect to address:port
+    PAT_QU,          // "QU"            - Exit monitor mode
+    PAT_NC,          // "NC"            - Get IP
+    PAT_PI_IP        // "PI x.y.z.w"    - Ping IP
+} PatternType;
 
-    // Send this message 5 times, SMDTC only stops the pinging after receiving 5 newlines (\n)
-    write(gLocal_fd, buf, strlen(buf));
-    write(gLocal_fd, buf, strlen(buf));
-    write(gLocal_fd, buf, strlen(buf));
-    write(gLocal_fd, buf, strlen(buf));
-    write(gLocal_fd, buf, strlen(buf));
+PatternType XPort_get_pattern_type(const char* str) 
+{
+    regex_t regex;
+    int ret;
+
+    struct 
+    {
+        const char *pattern;
+        PatternType type;
+    } patterns[] = 
+    {
+        {"^C0\\.0\\.0\\.0/0$", PAT_C_MONITOR},
+        {"^C[^:]+:[0-9]+$", PAT_C_ADDR_PORT},
+        {"^QU$", PAT_QU},
+        {"^NC$", PAT_NC},
+        {"^PI [0-9]{1,3}(\\.[0-9]{1,3}){3}$", PAT_PI_IP}
+    };
+
+    for (int i = 0; i < sizeof(patterns)/sizeof(patterns[0]); i++) 
+    {
+        if (regcomp(&regex, patterns[i].pattern, REG_EXTENDED | REG_NOSUB) != 0)
+            continue;
+
+        ret = regexec(&regex, str, 0, NULL, 0);
+        regfree(&regex);
+
+        if (ret == 0)
+            return patterns[i].type;
+    }
+
+    return PAT_NONE;
+}
+
+#define MAX_LINE_LEN 64
+
+int XPort_process_tx_line(const char *line, int len) 
+{
+    char clean_line[MAX_LINE_LEN];
+
+    memset(clean_line, 0, MAX_LINE_LEN);
+    strncpy(clean_line, line, len);
+
+    if (clean_line[len - 1] == '\n') 
+    {
+        clean_line[len - 1] = '\0';  // Trim newline
+    }
+
+    PatternType pat = XPort_get_pattern_type(clean_line);
+
+    switch (pat) 
+    {
+        case PAT_C_MONITOR:
+            EnterMonitor();
+        break;
+
+        case PAT_C_ADDR_PORT:
+        {        
+            char addr[128] = {0};
+            int port = 0;
+        
+            // Match: C<addr>:<port>
+            if (sscanf(clean_line, "C%127[^:]:%d", addr, &port) == 2) 
+            {
+                //printf("Addr: %s, Port: %d\n", addr, port);
+                gRemotePort = port;
+
+                if (ResolveHost(addr) == 0)
+                {
+                    char buf[4];
+                    snprintf(buf, sizeof(buf), ConnectRemoteTCP() ? "N" : "C");
+
+                    write(gLocal_fd, buf, strlen(buf));
+                }
+            } 
+            else 
+            {
+                printf("Malformed connect address:port command\n");
+            }
+            break;
+        }
+
+        case PAT_QU:
+            ExitMonitor();
+        break;
+
+        case PAT_NC:
+            GetLocalIP();
+        break;
+
+        case PAT_PI_IP:
+        {
+            char ip_address[64] = {0};
+        
+            // Expecting "PI x.x.x.x"
+            if (sscanf(clean_line, "PI %63s", ip_address) == 1) 
+            {
+                PingIP(ip_address);
+            } 
+            else 
+            {
+                printf("Malformed PI command\n");
+            }
+            break;
+        }
+
+        case PAT_NONE:
+        default:
+        return 0;
+    }
+
+    return 1;
 }
 
 void RunXPortEmulation()
 {
-    uint8_t buf_rx[256], buf_tx[256];   // Incoming/Outgoing byte buffer for recv
-    int r_rx = 0, r_tx = 0;             // Number of bytes received in buf_rx/buf_tx
-    int bInMonitorMode = 0;             // Flag indicating if the emulated xport device is in monitor mode
-
-    // Enter monitor mode specific pattern matching variables (Used when connected to remote server)
-    int EC = 0, NC = 0;
-    const char ENTER_PATTERN[] = "C0.0.0.0/0";
-    const int ENTER_LENGTH = sizeof(ENTER_PATTERN) - 1; // Length of pattern without null terminator
-
-    // Buffer for gLocal_fd data - Used to accumulate and check for the target command
-    uint8_t rxdata_buffer[512];
-    int rxdata_buffer_len = 0;
+    uint8_t buf_rx[BUF_SIZE], buf_tx[BUF_SIZE];   // Incoming/Outgoing byte buffer for recv
+    int r_rx = 0, r_tx = 0;                       // Number of bytes received in buf_rx/buf_tx
 
     pFileRemote = fopen("rx.log", "wb");
     pFileLocal = fopen("tx.log", "wb");
+
+    char rx_line_buf[MAX_LINE_LEN] = {0};
+    int rx_line_len = 0;
+    int bXPortMatch = 0;    // 0= None (Data) - 1= Match found, do not send it to remote
 
     while (1)
     {
@@ -422,8 +607,26 @@ void RunXPortEmulation()
         r_rx = recv(gRemote_fd, buf_rx, sizeof(buf_rx), MSG_DONTWAIT);
         if (r_rx > 0) 
         {
+            ssize_t n = 0;
+
             // Forward received data from gRemote_fd to gLocal_fd
-            write(gLocal_fd, buf_rx, r_rx);
+            if (bTTY_Connection) 
+                n = write(gLocal_fd, buf_rx, r_rx);
+            else 
+                n = send(gLocal_fd, buf_rx, r_rx, MSG_NOSIGNAL);
+
+            if (n == -1) 
+            {
+                int err = errno;
+
+                perror("write()/send() to local socket failed");
+
+                if ((err == EPIPE) || (err == ECONNRESET)) 
+                {  
+                    CloseRemoteSocket();    // No point in keeping the remote side connected, close it...
+                    WaitForLocal();         // Wait for local connection again
+                }
+            }
 
             // Log all RX traffic
             fwrite(buf_rx, sizeof(char), r_rx, pFileRemote);
@@ -438,126 +641,93 @@ void RunXPortEmulation()
 
         if (r_tx > 0)
         {
-            // Log all TX traffic
             fwrite(buf_tx, sizeof(char), r_tx, pFileLocal);
             fflush(pFileLocal);
 
-            // If connected to remote server, handle data transfer
-            if (gRemote_fd != -1)
+            bXPortMatch = 0;
+        
+            for (int i = 0; i < r_tx && rx_line_len < MAX_LINE_LEN - 1; ++i) 
             {
-                // Append received data to the persistent buffer
-                if (rxdata_buffer_len + r_tx < sizeof(rxdata_buffer))
+                rx_line_buf[rx_line_len++] = buf_tx[i];
+
+                // Check for newline
+                if (buf_tx[i] == '\n') 
                 {
-                    memcpy(rxdata_buffer + rxdata_buffer_len, buf_tx, r_tx);
-                    rxdata_buffer_len += r_tx;
-
-                    NC++; // Increment received character count
-
-                    if (rxdata_buffer[NC - 1] == ENTER_PATTERN[EC]) 
-                    {
-                        EC++; // Increment expected count if this character matches the pattern
-                    } 
-                    else 
-                    {
-                        // Reset both counters if there's a mismatch
-                        NC = 0;
-                        EC = 0;
-                    }
-
-                    // If the entire pattern is matched, enter monitor mode
-                    if (EC == ENTER_LENGTH) 
-                    {
-                        bInMonitorMode = EnterMonitor();
-                        rxdata_buffer_len = 0;
-                        EC = 0;
-                        NC = 0;
-                    } 
-                    //else if (EC == 0) 
-                    // ^ This is commented out because the above code makes the user unable to type/send any of the characters in ENTER_PATTERN
-                    // This is a workaround to keep sending the characters even if it is meant only for the xport emulator...
-                    {
-                        // If we aren't in the middle of matching the pattern, forward data to gRemote_fd
-                        send(gRemote_fd, rxdata_buffer, rxdata_buffer_len, MSG_DONTWAIT);
-                        rxdata_buffer_len = 0; // Clear buffer after forwarding
-                        NC = 0;
-                    }
+                    bXPortMatch = XPort_process_tx_line(rx_line_buf, rx_line_len);
+                    rx_line_len = 0;  // Reset for next message
+                    memset(rx_line_buf, 0, MAX_LINE_LEN);
                 }
             }
-            else
+
+            if ((bXPortMatch == 0) && (gRemote_fd != -1))
             {
-                // If gRemote_fd is not connected, just accumulate and parse for commands
-
-                // Append received data to the persistent buffer
-                if (rxdata_buffer_len + r_tx < sizeof(rxdata_buffer))
+                ssize_t n = send(gRemote_fd, buf_tx, r_tx, MSG_WAITALL | MSG_NOSIGNAL);
+                
+                if (n == -1) 
                 {
-                    memcpy(rxdata_buffer + rxdata_buffer_len, buf_tx, r_tx);
-                    rxdata_buffer_len += r_tx;
-                }
+                    int err = errno;
 
-                // Process buffer only if it contains a newline character
-                uint8_t *newline = memchr(rxdata_buffer, '\n', rxdata_buffer_len);
-                if (newline)
+                    perror("send() to remote socket failed");
+
+                    if ((err == EPIPE) || (err == ECONNRESET)) 
+                    {
+                        CloseRemoteSocket();
+                        rx_line_len = 0;
+                    }
+                }
+                /*else if (n > 0)
                 {
-                    // Calculate the length of the command up to and including the newline
-                    int cmd_len = newline - rxdata_buffer + 1;
+                    int EndLF = buf_tx[r_tx > 0 ? r_tx-1 : 0] == '\n' ? 1 : 0;
+                    int EndCR = buf_tx[r_tx > 0 ? r_tx-1 : 0] == '\r' ? 1 : 0;
+                    int r = EndLF + EndCR;
 
-                    // Temporarily null-terminate for command matching
-                    rxdata_buffer[cmd_len - 1] = '\0';
-
-                    // Check for known commands in order of specificity
-                    if (strcmp((char *)rxdata_buffer, "QU") == 0)
-                    {
-                        bInMonitorMode = ExitMonitor();
-                    }
-                    else if (strcmp((char *)rxdata_buffer, "C0.0.0.0/0") == 0)
-                    {
-                        bInMonitorMode = EnterMonitor();
-                    }
-                    else if (bInMonitorMode && strcmp((char *)rxdata_buffer, "NC") == 0)
-                    {
-                        GetLocalIP();
-                    }
-                    else if (bInMonitorMode && strncmp((char *)rxdata_buffer, "PI ", 3) == 0)
-                    {
-                        // Process "PI <IP>" command
-                        char ip_address[256] = {0};
-                        strncpy(ip_address, (char *)rxdata_buffer + 3, cmd_len - 4); // Exclude "PI " and '\0'
-                        PingIP(ip_address);
-                    }
-                    else if (rxdata_buffer[0] == 'C' && gRemote_fd == -1)
-                    {
-                        // Process "C<address>" command
-                        char target[256] = {0};
-                        strncpy(target, (char *)rxdata_buffer + 1, cmd_len - 2);  // Exclude 'C' and '\0'
-
-                        // Extract port if specified
-                        char *port_str = strchr(target, ':');
-                        if (port_str)
-                        {
-                            *port_str = '\0';
-                            port_str++;
-                            gRemotePort = atoi(port_str);
-                        }
-                        else
-                        {
-                            gRemotePort = 0;
-                        }
-
-                        if (ResolveHost(target) == 0)
-                        {
-                            char buf[4];
-                            snprintf(buf, sizeof(buf), ConnectRemoteTCP() ? "N" : "C");
-
-                            write(gLocal_fd, buf, strlen(buf));
-                        }
-                    }
-
-                    // Remove processed command from the buffer
-                    rxdata_buffer_len -= cmd_len;
-                    memmove(rxdata_buffer, rxdata_buffer + cmd_len, rxdata_buffer_len);
-                }
+                    printf("Sending to remote: \"%.*s\" - ", r_tx-r, buf_tx);
+                    printf("Ending in CR/LF: %s\n", r ? "yes" : "no ");
+                }*/
+                
+                rx_line_len = 0;
+                memset(rx_line_buf, 0, MAX_LINE_LEN);
             }
         }
+
+        // Delay to avoid CPU overuse and to buffer data
+        if (bTTY_Connection) usleep(2000);
+        else usleep(50000);
+    }
+
+    exit(EXIT_SUCCESS);
+}
+
+void RunTEST()
+{
+    uint8_t buf_rx[BUF_SIZE], buf_tx[BUF_SIZE];   // Incoming/Outgoing byte buffer for recv
+    int r_rx = 0, r_tx = 0;                       // Number of bytes received in buf_rx/buf_tx
+    int len = 0;
+    char c;
+
+    while (1)
+    {
+        printf("Send a message: ");
+        while (c != '\n')
+        {
+            c = getchar();
+            buf_tx[len] = c;
+            len++;
+        }
+
+        send(gLocal_fd, buf_tx, len, MSG_DONTWAIT);
+
+        memset(buf_tx, 0, BUF_SIZE);
+
+        // Read from gLocal_fd if data is available
+        r_tx = recv(gLocal_fd, buf_tx, len, MSG_WAITALL);
+        if (r_tx > 0)
+        {
+            printf("Message from local: %s\n", buf_tx);
+        }
+
+        len = 0;
+        c = 0;
 
         // Small delay to avoid CPU overuse
         usleep(500);
@@ -568,36 +738,44 @@ void RunXPortEmulation()
 
 int main(int argc, char *argv[])
 {
-    signal(SIGINT, SignCB);
-    signal(SIGTERM, SignCB);
-    signal(SIGABRT, SignCB);
-    signal(SIGFPE, SignCB);
-    signal(SIGSEGV, SignCB);
+    signal(SIGINT, SigCB);
+    signal(SIGTERM, SigCB);
+    signal(SIGABRT, SigCB);
+    signal(SIGFPE, SigCB);
+    signal(SIGSEGV, SigCB);
+
+    signal(SIGPIPE, SIG_IGN);
+    //signal(SIGPIPE, SigPipe);
 
     #ifdef __linux__
-    signal(SIGQUIT, SignCB);
-    signal(SIGBUS, SignCB);
+    signal(SIGQUIT, SigCB);
+    signal(SIGBUS, SigCB);
     #endif
 
     atexit(Shutdown);
 
+    // xPort emulator communication using local serial port
     if ((argc > 2) && (strcmp(argv[1], "-xport") == 0))
     {
         strncpy(gLocalAddress, argv[2], ADDR_LEN);
         OpenLocalTTY();
-
         RunXPortEmulation();
     }
+    // xPort emulator communication using sockets
     else if ((argc > 2) && (strcmp(argv[1], "-xportsock") == 0))
     {
-        strncpy(gLocalAddress, argv[2], ADDR_LEN);
-        if (OpenLocalSocket())
-        {
-            WaitForLocal();
-        }
-
+        strncpy(gLocalAddress, argv[2], ADDR_LEN);        
+        WaitForLocal();
         RunXPortEmulation();
     }
+    // Test command for sending/receiving text
+    else if ((argc > 2) && (strcmp(argv[1], "-test") == 0))
+    {
+        strncpy(gLocalAddress, argv[2], ADDR_LEN);
+        WaitForLocal();
+        RunTEST();
+    }
+    // Connect local serial port to remote server
     else if (argc == 3)
     {
         char TMP_Host[ADDR_LEN];
@@ -636,11 +814,10 @@ int main(int argc, char *argv[])
     }
     else 
     {
-        printf("SMDT PC Communicator v1.2\n\nUsage example:\n", argv[0]);
+        printf("SMDT PC Communicator v1.3\n\nUsage example:\n", argv[0]);
         printf("%s -local=/dev/ttyS4 -remote=127.0.0.1:6969     - Connect local serial port to remote server\n", argv[0]);
         printf("%s -xport /dev/ttyS4                            - xPort emulator communication using local serial port\n", argv[0]);
         printf("%s -xportsock ./socketfile.sock                 - xPort emulator communication using sockets\n\n", argv[0]);
-        exit(EXIT_SUCCESS);
     }
 
     exit(EXIT_SUCCESS);

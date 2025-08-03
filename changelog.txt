@@ -1,3 +1,14 @@
+v1.3
+Better, but not perfect, xport pattern matcher using regex.
+Added ping functionality to the xport emulator.
+Taking care of SIGPIPE; Xport emulator will now deal with SIGPIPE when sending data to avoid closing smdt-pc and local application when the remote connection has dropped.
+Longer sleep time to accumulate more data in buffers when using sockets.
+
+v1.2
+Added waiting for local/remote connection.
+Fixed a bug where the user in SMDT couldn't send any of the characters that matches the ENTER_PATTERN; C0.0.0.0/0 - not being able to type or send these characters is a bit of a problem :)
+Crashfix on Mac; using incorrect sun_path size - Thanks to redbug26 for the fix!
+
 v1.1 Bugfixes
 Changed the xport emulator to not rely on \n (newline) anymore to know when to process data. This fixes IAC communications with Telnet servers.
 Added traffic logging to the xport emulator. Data will be output to rx.log and tx.log respectively.
